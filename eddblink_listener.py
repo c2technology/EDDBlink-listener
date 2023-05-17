@@ -12,6 +12,7 @@ import sqlite3
 import csv
 import codecs
 import sys
+import signal
 
 try:
     import trade
@@ -28,6 +29,11 @@ from calendar import timegm
 from pathlib import Path
 from collections import defaultdict, namedtuple, deque, OrderedDict
 from distutils.version import LooseVersion
+
+signals = {
+    signal.SIGINT: 'SIGINT',
+    signal.SIGTERM: 'SIGTERM'
+}
 
 _minute = 60
 _hour = 3600
@@ -228,7 +234,7 @@ class Listener(object):
                                 print(system + "/" + station + " rejected with:" + software + swVersion + "\n")
                             continue
                     # We've received real data.
-                    
+                    print(system + "/" + station + ": update accepted from client: " + software + " v" + swVersion + "\n")
                     # Normalize timestamps
                     timestamp = timestamp.replace("T", " ").replace("+00:00", "")
                     
@@ -291,7 +297,6 @@ def db_execute(db, sql_cmd, args = None):
                     success = True
                     raise sqlite3.OperationalError(e)
                 else:
-                    print("Database is locked, waiting for access.", end = "\n")
                     print(e)
                     time.sleep(1)
     return result
@@ -612,7 +617,7 @@ def process_messages():
     getOldStationInfo = (
         "SELECT name, ls_from_star,blackmarket, max_pad_size, "
         "market, shipyard, outfitting, rearm, refuel, repair, "
-        "planetary, type_id from Station, WHERE station_id = ?"
+        "planetary, type_id from Station WHERE station_id = ?"
     )
     insertNewStation = (
         "INSERT OR IGNORE INTO Station("
@@ -672,16 +677,16 @@ def process_messages():
         market_id = entry.market_id
         modified = entry.timestamp.replace('T', ' ').replace('Z', '')
         commodities = entry.commodities
-        
+        software = entry.software
+        swVersion = entry.version 
         #All the stations should be stored using the market_id.
-        exists = curs.execute("SELECT station_id FROM Station WHERE station_id = ?", market_id).fetchone()
-        
+        exists = curs.execute("SELECT station_id FROM Station WHERE station_id = ?", [market_id]).fetchone()
+        system_id = system_ids.get(system)
         if not exists:
             station_id = station_ids.get(system + "/" + station)
             if not station_id:
                 # Mobile stations are stored in the dict a bit differently.
                 station_id = station_ids.get("MEGASHIP/" + station)
-                system_id = system_ids.get(system)
                 if station_id and system_id:
                     if config['verbose']:
                         print("Megaship station, updating system to " + system)
@@ -697,8 +702,8 @@ def process_messages():
                             if config['verbose']:
                                 print("ERROR: Not found in Systems: " + system + "/" + station)
                             continue
-                        except sqlite3.OperationalError:
-                            print("Database is locked, waiting for access.", end = "\n")
+                        except sqlite3.OperationalError as e:
+                            print(e)
                             time.sleep(1)
                 else:
                     # If we can't find it by any of these means, it must be a 'new' station.
@@ -718,30 +723,31 @@ def process_messages():
                             if config['verbose']:
                                 print(e)
                             continue
-                        except sqlite3.OperationalError:
-                            print("Database is locked, waiting for access.", end = "\n")
+                        except sqlite3.OperationalError as e:
+                            print(e)
                             time.sleep(1)
                     continue
             if station_id and (station_id != market_id):
                 success = False
                 while not success:
                     try:
+
                         curs.execute("BEGIN IMMEDIATE")
-                        result = curs.execute(getOldStationInfo, station_id)
+                        result = curs.execute(getOldStationInfo, [station_id])
                         nm, ls, bm, mps, mk, sy, of, ra, rf, rp, pl, ti = result.fetchone()
-                                            
+                        
                         curs.execute(insertNewStation, (market_id, nm, system_id, ls, bm, 
                                                         mps, mk, sy, modified, 
                                                         of, ra, rf, rp, pl, ti))
-                        curs.execute(removeOldStation, station_id)
+                        curs.execute(removeOldStation, [station_id])
                         db.commit()
                         success = True
                     except sqlite3.IntegrityError as e:
                         if config['verbose']:
                             print(e)
                         continue
-                    except sqlite3.OperationalError:
-                        print("Database is locked, waiting for access.", end = "\n")
+                    except sqlite3.OperationalError as e:
+                        print(e)
                         time.sleep(1)
         station_id = market_id
         
@@ -781,35 +787,35 @@ def process_messages():
             try:
                 curs.execute("BEGIN IMMEDIATE")
                 success = True
-            except sqlite3.OperationalError:
-                print("Database is locked, waiting for access.", end = "\n")
+            except sqlite3.OperationalError as e:
+                print(e)
                 time.sleep(1)
-        
+
         curs.execute(deleteStationItemEntry, (station_id,))
-        
+
         for item in itemList:
             try:
                 curs.execute(insertStationItemEntry, item)
             except Exception as e:
                 if config['debug']:
                     print("Error '" + str(e) + "' when inserting item:\n\t(Not in DB's Item table?) fdev_id: " + str(item[1]))
-        
+    
         for avg in avgList:
             try:
                 curs.execute(updateItemAveragePrice, avg)
             except Exception as e:
                 if config['debug']:
                     print("Error '" + str(e) + "' when inserting average:\n" + str(avg))
-        
+
         success = False
         while not success:
             try:
                 db.commit()
                 success = True
-            except sqlite3.OperationalError:
-                print("Database is locked, waiting for access.", end = "\n")
+            except sqlite3.OperationalError as e:
+                print(e)
                 time.sleep(1)
-        
+
         if config['verbose']:
             print("Updated " + system + "/" + station + ", station_id:'" + str(station_id) + "', from "+ software + " v" + swVersion)
         else:
@@ -989,8 +995,8 @@ def export_dump():
                 try:
                     db.commit()
                     success = True
-                except sqlite3.OperationalError:
-                    print("(commit) Database is locked, waiting for access.", end = "\r")
+                except sqlite3.OperationalError as e:
+                    print(e)
                     time.sleep(1)
 
             cursor = fetchIter(db_execute(db, "SELECT * FROM StationItem ORDER BY station_id, item_id"))
@@ -1113,11 +1119,19 @@ def update_dicts():
     
     return db_name, item_ids, system_ids, station_ids
 
+def exit_gracefully(signum, frame):
+    print("\nReceived {} signal".format(signals[signum]))
+    print("Cleaning up resources. End of the program")
+    go = False
+    
 update_busy = False
 process_ack = False
 live_ack = False
 live_busy = False
 dump_busy = False
+
+signal.signal(signal.SIGINT, exit_gracefully)
+signal.signal(signal.SIGTERM, exit_gracefully)
 
 go = True
 q = deque()
@@ -1169,3 +1183,4 @@ except KeyboardInterrupt:
     print("CTRL-C detected, stopping.")
     print("Please wait for all processes to report they are finished, in case they are currently active.")
     go = False
+    
